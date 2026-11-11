@@ -48,6 +48,16 @@ class RewardShapingConfig(BaseModel, extra="allow"):
     # When set to 1, no penalty is applied (default behavior).
     stop_properly_penalty_coef: float | None = None
 
+    # When True, cap the DAPO overlong penalty at -overlong_buffer_penalty when
+    # response length exceeds max_response_length (important for multi-turn
+    # trajectories where summed assistant turns can exceed single-turn max_tokens).
+    clamp_overlong_penalty: bool = False
+
+    # When True and both stop_properly_penalty_coef and DAPO overlong_buffer_*
+    # are configured, apply stop_properly scaling first and then apply DAPO
+    # overlong buffer shaping instead of returning early.
+    combine_stop_properly_and_overlong: bool = False
+
     @model_validator(mode="after")
     def validate_settings(self) -> "RewardShapingConfig":
         """Validate active shaping parameters before any backend consumes them."""
@@ -61,7 +71,8 @@ class RewardShapingConfig(BaseModel, extra="allow"):
                     f"reward_shaping.stop_properly_penalty_coef={coef} must be in "
                     "[0, 1]. It scales a truncated row's reward."
                 )
-            return self
+            if not self.combine_stop_properly_and_overlong:
+                return self
 
         buffer_length = self.overlong_buffer_length
         buffer_penalty = self.overlong_buffer_penalty
@@ -135,18 +146,26 @@ def apply_reward_shaping(
             f"stop_properly_penalty_coef must be in [0, 1], got {stop_properly_penalty_coef}"
         )
         # Warn user that DAPO overlong parameters are ignored when stop_properly_penalty_coef is set
+        # unless combine_stop_properly_and_overlong is explicitly enabled.
+        has_dapo_overlong = (
+            cfg.overlong_buffer_length is not None
+            and cfg.overlong_buffer_penalty is not None
+            and cfg.max_response_length is not None
+        )
         ignored_params = []
-        if cfg.overlong_buffer_length is not None:
-            ignored_params.append("overlong_buffer_length")
-        if cfg.overlong_buffer_penalty is not None:
-            ignored_params.append("overlong_buffer_penalty")
-        if cfg.max_response_length is not None:
-            ignored_params.append("max_response_length")
+        if not cfg.combine_stop_properly_and_overlong:
+            if cfg.overlong_buffer_length is not None:
+                ignored_params.append("overlong_buffer_length")
+            if cfg.overlong_buffer_penalty is not None:
+                ignored_params.append("overlong_buffer_penalty")
+            if cfg.max_response_length is not None:
+                ignored_params.append("max_response_length")
         if ignored_params:
             print(
                 f"[WARN] stop_properly_penalty_coef is set, so the following DAPO overlong "
                 f"parameters are ignored: {', '.join(ignored_params)}. "
-                f"Set stop_properly_penalty_coef=null to use DAPO overlong reward shaping instead.",
+                f"Set stop_properly_penalty_coef=null or combine_stop_properly_and_overlong=true "
+                f"to use DAPO overlong reward shaping.",
                 flush=True,
             )
         truncated = batch.get("truncated")
@@ -177,7 +196,8 @@ def apply_reward_shaping(
                 flush=True,
             )
 
-        return batch
+        if not (cfg.combine_stop_properly_and_overlong and has_dapo_overlong):
+            return batch
 
     # DAPO reward shaping requires overlong_buffer_length, overlong_buffer_penalty, and max_response_length to be set.
     overlong_buffer_length = cfg.overlong_buffer_length
@@ -231,6 +251,8 @@ def apply_reward_shaping(
         overlong_reward = min(
             -exceed_length / overlong_buffer_length * overlong_buffer_penalty, 0
         )
+        if cfg.clamp_overlong_penalty:
+            overlong_reward = max(overlong_reward, -overlong_buffer_penalty)
         updated_rewards[i] = rewards[i] + overlong_reward
 
     # Update the rewards in the batch
