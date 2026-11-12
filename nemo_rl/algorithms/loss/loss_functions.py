@@ -180,6 +180,12 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: bool = False
+    # If True alongside sequence_level_importance_ratios, normalize the
+    # off-policy actor-vs-generation log-ratio by sequence length (geometric
+    # mean, matching GSPO's inner PPO ratio in clipped_pg_actor_objective) so
+    # long sequences do not overflow/underflow exp(sum_t delta_logp).
+    # Defaults to False to preserve pinned historical golden numerics.
+    sequence_level_importance_sampling_geometric_mean: bool = False
 
     # --- Clipping ---
     ratio_clip_min: float = 0.2
@@ -418,6 +424,9 @@ class ClippedPGLossFn(LossFunction):
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
+        self.sequence_level_importance_sampling_geometric_mean = (
+            cfg.sequence_level_importance_sampling_geometric_mean
+        )
         self.positive_example_nll_weight = cfg.positive_example_nll_weight
         self.metrics_level = cfg.metrics_level
         self.enable_torch_compile = cfg.enable_torch_compile
@@ -908,8 +917,12 @@ class ClippedPGLossFn(LossFunction):
             # importance weights in this mode.
             actor_importance_weights_expanded = None
         elif self.sequence_level_importance_ratios:
-            # importance weight w_i = exp(Σ_t (log π_actor − log π_behaviour))
+            # Default: w_i = exp(Σ_t (log π_actor − log π_behaviour))
+            # Geometric mean opt-in (GSPO-consistent): w_i = exp((1/|y_i|) Σ_t (log π_actor − log π_behaviour))
             seq_lp_diff = ((prev_logprobs - generation_logprobs) * mask).sum(dim=-1)
+            if self.sequence_level_importance_sampling_geometric_mean:
+                seq_lengths = mask.sum(dim=-1).clamp(min=1.0)
+                seq_lp_diff = seq_lp_diff / seq_lengths
             actor_importance_weights = torch.exp(seq_lp_diff).detach()
             actor_importance_weights = torch.nan_to_num(
                 actor_importance_weights, nan=0.0, posinf=0.0, neginf=0.0
